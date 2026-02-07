@@ -736,90 +736,36 @@ def process_tdna_data(parsed_df, batch_id=None, bridge_table_path=None):
                     col("item.allianceTier.priorityCode").alias("alliance_tier_priority")
                 ], "memberships", None, batch_id, "Memberships Processing"
             )
-
-            # Process preferences data
+            # Process preferences for Cosmos output
             try:
-                reference_raw_path = "/Volumes/ops_catalog/cxops/edpppecops_raw/eag/ey/guest_preference_reference_zone/"
                 reference_prod_path = "/Volumes/ops_catalog/cxops/edpppecops_product/eag/ey/guest_preference_reference_zone/"
                 
-                print(f" [{batch_id}] Reading preferences data from {reference_raw_path}")
-                reference_df = spark.read.format("json").option("multiline", "true").option("recursiveFileLookup", "true").load(reference_raw_path)
-                print(f" [{batch_id}] Preferences columns: {reference_df.columns}")
-
-                # Extract ffpNumber - keep struct for output, create string for Delta storage
-                reference_df = reference_df.select(
-                    col("preferences.ffpNumber").alias("ffp_number"),
-                    col("preferences").alias("preference_json"),
-                    F.to_json(col("preferences")).alias("preference_body_string"),
-                    F.current_timestamp().alias("ingestion_datetime"),
-                    F.current_date().alias("ingestion_date")
-                ).filter(col("ffp_number").isNotNull())
+                # Read preferences from product zone (already written by extract_json_body_fields)
+                print(f" [{batch_id}] Reading preferences from product zone for Cosmos output")
+                preferences_from_prod = spark.read.format("delta").load(reference_prod_path)
                 
-                pref_count = reference_df.count()
-                print(f" [{batch_id}] Valid preferences loaded: {pref_count} records")
-                # Explode membership_result to get individual member_ids per profile
-                read_from_tdna_df= spark.read.format("delta").load("abfss://prodedp@stedpprod.dfs.corewindows.net//product/eag/ey/TDNA/Trans_TDNAMemberships/")
-               
-                # Join preferences with membership data on member_id = ffp_number
-                joined_preferences = read_from_tdna_df.join(
-                    broadcast(reference_df),
-                    read_from_tdna_df.member_id == reference_df.ffp_number,
+                # Join preferences with current batch profiles
+                preferences_result = tdna_df.select("profile_id", "profile_version").distinct().join(
+                    preferences_from_prod.select(
+                        "profile_id",
+                        col("preference_body")
+                    ),
+                    ["profile_id"],
                     "left"
-                ).select(
-                    "profile_id",
-                    "ffp_number",
-                    "preference_json",
-                    "preference_body_string",
-                    "ingestion_datetime",
-                    "ingestion_date"
-                )
-                
-                # Write to product zone using MERGE (upsert) operation - use string version
-                preference_master_df = joined_preferences.select(
-                    "profile_id",
-                    "ffp_number",
-                    col("preference_body_string").alias("preference_body"),
-                    "ingestion_datetime",
-                    "ingestion_date"
-                )
-                
-                # # Check if the target table exists
-                if DeltaTable.isDeltaTable(spark, reference_prod_path):
-                    # Table exists - perform MERGE (upsert)
-                    target_table = DeltaTable.forPath(spark, reference_prod_path)
-                    
-                    target_table.alias("target").merge(
-                        preference_master_df.alias("source"),
-                        "target.profile_id = source.profile_id AND target.ffp_number = source.ffp_number"
-                    ).whenMatchedUpdate(
-                        condition="target.preference_body != source.preference_body",
-                        set={
-                            "preference_body": "source.preference_body",
-                            "ingestion_datetime": "source.ingestion_datetime",
-                            "ingestion_date": "source.ingestion_date"
-                        }
-                    ).whenNotMatchedInsertAll().execute()
-                    
-                    print(f" [{batch_id}] Preferences data merged (upserted) to {reference_prod_path}")
-                else:
-                    # Table doesn't exist - create it with initial load
-                    preference_master_df.write.format("delta").mode("overwrite").save(reference_prod_path)
-                    print(f" [{batch_id}] Preferences table created at {reference_prod_path}")
-                
-                # Aggregate preferences per profile - use struct array for final output
-                preferences_result = joined_preferences.groupBy("profile_id").agg(F.collect_list("preference_json").alias("preferences"))
-                
-                
-                # Ensure all profiles have preferences field (empty array if null)
-                preferences_result = all_profiles.join(preferences_result, ["profile_id"], "left").withColumn(
+                ).withColumn(
                     "preferences",
-                    F.when(F.col("preferences").isNull(), F.array()).otherwise(F.col("preferences")))
+                    F.when(
+                        col("preference_body").isNotNull(),
+                        F.array(col("preference_body"))
+                    ).otherwise(F.array())
+                ).select("profile_id", "profile_version", "preferences")
                 
+                print(f" [{batch_id}] Preferences loaded for Cosmos: {preferences_result.count()} records")
                 
             except Exception as pref_err:
-                print(f" [{batch_id}] Warning: Could not process preferences data: {str(pref_err)}")
+                print(f" [{batch_id}] Warning: Could not load preferences for Cosmos output: {str(pref_err)}")
                 traceback.print_exc()
-                # Create empty preferences result with empty array
+                # Create empty preferences result
                 preferences_result = all_profiles.withColumn("preferences", F.array())
             try:
                 # Combine explosions where possible
