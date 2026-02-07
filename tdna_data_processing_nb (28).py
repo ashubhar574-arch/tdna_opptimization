@@ -1150,6 +1150,8 @@ def extract_json_body_fields(
                 .alias("to_customer_ids"),
             col("parsed_json.LiveFeed.dictionary.pnrSources").alias("pnrSources"),
             col("parsed_json.LiveFeed.customer.profile.links").alias("links"),
+            col("parsed_json.LiveFeed.customer.profile.metrics").alias("metrics"),
+            col("parsed_json.LiveFeed.customer.profile.memberships").alias("memberships"),
             lit(batch_id).alias("batch_id")
         )
         #product layer
@@ -1180,7 +1182,122 @@ def extract_json_body_fields(
             )
         #bridge table
         if bridge_table_path:
+        
+            print(f" [{batch_id}] ===== BRIDGE TABLE PROCESSING STARTED =====")
+            print(f" [{batch_id}] Bridge table path: {bridge_table_path}")
             try:
+                # Process preferences data
+                try:
+                    reference_raw_path = "/Volumes/ops_catalog/cxops/edpppecops_raw/eag/ey/guest_preference_reference_zone/"
+                    reference_prod_path = "/Volumes/ops_catalog/cxops/edpppecops_product/eag/ey/guest_preference_reference_zone/"
+                    
+                    print(f" [{batch_id}] Reading preferences data from {reference_raw_path}")
+                    reference_df = spark.read.format("json").option("multiline", "true").option("recursiveFileLookup", "true").load(reference_raw_path)
+                    
+                    # Extract ffpNumber and create preference_body
+                    reference_df = reference_df.select(
+                        col("preferences.ffpNumber").alias("ffp_number"),
+                        F.to_json(col("preferences")).alias("preference_body"),
+                        F.current_timestamp().alias("ingestion_datetime"),
+                        F.current_date().alias("ingestion_date")
+                    ).filter(col("ffp_number").isNotNull())
+                    
+                    # Read TDNA memberships from product zone (contains all historical memberships)
+                    print(f" [{batch_id}] Reading TDNA memberships from product zone")
+                    read_from_tdna_df = spark.read.format("delta").load("/Volumes/ops_catalog/cxops/edpppecops_product/eag/ey/dummy_tdna_memberships/")
+                    
+                    # Join preferences with membership data on member_id = ffp_number
+                    preferences_with_profile = broadcast(reference_df).join(
+                        read_from_tdna_df,
+                        reference_df.ffp_number == read_from_tdna_df.member_id,
+                        "left"
+                    ).select(
+                        "profile_id",
+                        col("ffp_number").alias("ffp_number"),
+                        "preference_body",
+                        "ingestion_datetime",
+                        "ingestion_date"
+                    ).distinct()
+                    
+                    print(f" [{batch_id}] Preferences joined with profiles: {preferences_with_profile.count()} records")
+                    
+                    # Write to product zone using MERGE (upsert) operation
+                    if preferences_with_profile.count() > 0:
+                        preference_master_df = preferences_with_profile.select(
+                            "profile_id",
+                            "ffp_number",
+                            "preference_body",
+                            "ingestion_datetime",
+                            "ingestion_date"
+                        )
+                        
+                        if DeltaTable.isDeltaTable(spark, reference_prod_path):
+                            # Table exists - perform MERGE (upsert)
+                            target_table = DeltaTable.forPath(spark, reference_prod_path)
+                            
+                            target_table.alias("target").merge(
+                                preference_master_df.alias("source"),
+                                "target.profile_id = source.profile_id AND target.ffp_number = source.ffp_number"
+                            ).whenMatchedUpdate(
+                                condition="target.preference_body != source.preference_body",
+                                set={
+                                    "preference_body": "source.preference_body",
+                                    "ingestion_datetime": "source.ingestion_datetime",
+                                    "ingestion_date": "source.ingestion_date"
+                                }
+                            ).whenNotMatchedInsertAll().execute()
+                            
+                            print(f" [{batch_id}] Preferences data merged (upserted) to {reference_prod_path}")
+                        else:
+                            # Table doesn't exist - create it with initial load
+                            preference_master_df.write.format("delta").mode("overwrite").save(reference_prod_path)
+                            print(f" [{batch_id}] Preferences table created at {reference_prod_path}")
+                    
+                    # Keep only profile_id and preference_body for bridge table join
+                    preferences_with_profile = preferences_with_profile.select(
+                        "profile_id",
+                        "preference_body",
+                        "ffp_number"
+                    ).distinct()
+                    print(f" [{batch_id}] Preferences processing completed for bridge table")
+                except Exception as pref_err:
+                    print(f" [{batch_id}] Warning: Could not process preferences data: {str(pref_err)}")
+                    # Create empty preferences dataframe
+                    preferences_with_profile = extracted_df.select(
+                        "profile_id"
+                    ).limit(0).withColumn("preference_body", lit(None).cast("string"))
+                
+                # Process metrics data
+                try:
+                    metrics_processed = extracted_df.select(
+                        "profile_id",
+                        explode_outer("metrics").alias("metric_item")
+                    ).select(
+                        "profile_id",
+                        col("metric_item.code").alias("code"),
+                        col("metric_item.name").alias("name"),
+                        col("metric_item.value").alias("value")
+                    ).filter(
+                        (col("code").isNotNull()) | (col("name").isNotNull()) | (col("value").isNotNull())
+                    ).groupBy("profile_id").agg(
+                        F.collect_list(
+                            F.struct(
+                                col("code").alias("code"),
+                                col("name").alias("name"),
+                                col("value").alias("value")
+                            )
+                        ).alias("metrics")
+                    )
+                    
+                    print(f" [{batch_id}] Metrics processed: {metrics_processed.count()} profiles with metrics")
+                    
+                except Exception as metrics_err:
+                    print(f" [{batch_id}] Warning: Could not process metrics data: {str(metrics_err)}")
+                    # Create empty metrics dataframe
+                    metrics_processed = extracted_df.select(
+                        "profile_id"
+                    ).limit(0).withColumn("metrics", lit(None).cast("string"))
+                print(f" [{batch_id}] Starting bridge dataframe creation from extracted_df")
                 base_bridge_df = extracted_df.select(
                     col("profile_id").alias("tdna_profile_id"),
                     "pnrSources",
@@ -1254,6 +1371,26 @@ def extract_json_body_fields(
                         "last_modification_datetime",  
                         "last_modification_date"     
                     )
+                    .join(
+                        preferences_with_profile,
+                        bridge_df.tdna_profile_id == preferences_with_profile.profile_id,
+                        "left"
+                    )
+                    .join(
+                        metrics_processed,
+                        bridge_df.tdna_profile_id == metrics_processed.profile_id,
+                        "left"
+                    )
+                    .select(
+                        "tdna_profile_id",
+                        "pnr_number",
+                        "traveler_id",
+                        "last_modification_datetime",
+                        "last_modification_date",
+                        "preference_body",
+                        "ffp_number",
+                        "metrics"
+                    )
                 )
 
                 # ---- deduplicate (latest record)
@@ -1269,6 +1406,11 @@ def extract_json_body_fields(
                     .filter(col("rn") == 1)
                     .drop("rn")
                 )
+
+                record_count = bridge_dedup_df.count()
+                print(f" [{batch_id}] Bridge records to write: {record_count}")
+                print(f" [{batch_id}] Writing to bridge table: {bridge_table_path}")
+
                 if DeltaTable.isDeltaTable(spark, bridge_table_path):
                     (
                         bridge_dedup_df.write
@@ -1278,7 +1420,9 @@ def extract_json_body_fields(
                         .mode("append")
                         .save(bridge_table_path)
                     )
+                    print(f" [{batch_id}] Bridge data written successfully (APPEND)")
                 else:
+                    print(f" [{batch_id}] Bridge table does not exist - using OVERWRITE mode")
                     (
                         bridge_dedup_df.write
                         .format("delta")
@@ -1287,8 +1431,13 @@ def extract_json_body_fields(
                         .mode("overwrite")
                         .save(bridge_table_path)
                     )
+                    print(f" [{batch_id}] Bridge data written successfully (OVERWRITE)")
+                
+                print(f" [{batch_id}] ===== BRIDGE TABLE PROCESSING COMPLETED =====")
 
             except Exception as e:
+                print(f" [{batch_id}] !!!!! BRIDGE TABLE PROCESSING FAILED !!!!!")
+                print(f" [{batch_id}] Bridge error: {str(e)}")
                 if logger:
                     logger.warning(
                         f"[{batch_id}] Bridge processing failed: {str(e)}"
@@ -1301,7 +1450,6 @@ def extract_json_body_fields(
                 f"[{batch_id}] JSON extraction failed: {str(e)}"
             )
         return streaming_df.select("json_body", "enqueuedTime")
-
 # COMMAND ----------
 
 def write_to_cosmos_by_operation(final_result, working_format, cfg, batch_id, logger):
